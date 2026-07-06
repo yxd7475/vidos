@@ -20,6 +20,8 @@ from PySide6.QtCore import Qt, QPoint, QRect, Signal
 from PySide6.QtGui import QPainter, QPen, QColor, QFont, QPainterPath, QGuiApplication
 from PySide6.QtWidgets import QWidget
 
+from screenrec.ui.cursor_hint import CursorHintWindow
+
 
 def _now_ms() -> int:
     return int(time.perf_counter() * 1000)
@@ -149,6 +151,11 @@ class AnnotationOverlay(QWidget):
         # 信号槽：把轮询线程的鼠标事件切到主线程
         self._mouse_event.connect(self._handle_mouse_event, Qt.QueuedConnection)
 
+        # 顶部提示窗口：对屏幕捕获隐藏，不会出现在录屏里
+        self._cursor_hint = CursorHintWindow(self)
+        self.tool_changed.connect(self._refresh_cursor_hint)
+        self.annotation_changed.connect(self._refresh_cursor_hint)
+
         # 用轮询替代钩子：在独立线程跑，不依赖 Qt 消息循环
         from screenrec.platform.mouse_poll import MousePoller
         self._poller = MousePoller(self._on_mouse_event, interval=0.005)
@@ -156,6 +163,9 @@ class AnnotationOverlay(QWidget):
 
         # 点击反馈动画定时器
         self._anim_timer = self.startTimer(50)
+
+        # 初始提示
+        self._refresh_cursor_hint()
 
     def __del__(self):
         try:
@@ -277,6 +287,7 @@ class AnnotationOverlay(QWidget):
             self._selected_idx = None
             self._drag_offset = None
             self.update()
+            self._refresh_cursor_hint()
 
     @staticmethod
     def _point_distance(p1: QPoint, p2: QPoint) -> float:
@@ -408,6 +419,7 @@ class AnnotationOverlay(QWidget):
                 else:
                     self._selected_idx = None
                 self.update()
+                self._refresh_cursor_hint()
                 return
             # pen / rect / arrow：开始绘制
             self._drawing = True
@@ -600,9 +612,6 @@ class AnnotationOverlay(QWidget):
                 self._draw_selection(painter, shape)
         # 画鼠标轨迹（在标注之上、点击反馈之下）
         self._draw_trail(painter)
-        # 画 cursor 工具提示
-        if self.tool == "cursor":
-            self._draw_cursor_hint(painter)
         # 画点击反馈（ripple 动画）
         now = _now_ms()
         for c in self._clicks:
@@ -625,32 +634,22 @@ class AnnotationOverlay(QWidget):
                 painter.setBrush(Qt.NoBrush)
                 painter.drawEllipse(c["pos"], ring_r, ring_r)
 
-    def _draw_cursor_hint(self, painter: QPainter) -> None:
-        """cursor 工具激活时在屏幕顶部显示提示。"""
+    def _refresh_cursor_hint(self, *args) -> None:
+        """更新顶部提示窗口的文本。
+
+        提示文字通过 CursorHintWindow 显示——它对屏幕捕获隐藏，
+        不会出现在录屏里。tool/shapes/selected_idx 变化时调用。
+        """
+        if self.tool != "cursor":
+            self._cursor_hint.set_text("")
+            return
         if self._selected_idx is not None:
-            hint = "已选中标注 · 拖动移动 · Delete 删除 · Esc 取消"
+            text = "已选中标注 · 拖动移动 · Delete 删除 · Esc 取消"
         elif self.shapes:
-            hint = "选择模式 · 点击标注选中 · 拖动移动 · Delete 删除"
+            text = "选择模式 · 点击标注选中 · 拖动移动 · Delete 删除"
         else:
-            hint = "选择模式 · 还没有标注，先切换到画笔/矩形/箭头/文字工具绘制"
-        painter.setPen(QColor(255, 255, 255, 230))
-        painter.setFont(QFont("Microsoft YaHei", 11))
-        # 计算文字宽度
-        fm = painter.fontMetrics()
-        text_w = fm.horizontalAdvance(hint)
-        text_h = fm.height()
-        # 背景圆角矩形
-        margin = 12
-        bg_w = text_w + margin * 2
-        bg_h = text_h + 8
-        bg_x = (self.width() - bg_w) // 2
-        bg_y = 12
-        painter.setBrush(QColor(44, 62, 80, 220))
-        painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(bg_x, bg_y, bg_w, bg_h, 6, 6)
-        # 文字
-        painter.setPen(QColor(255, 255, 255, 230))
-        painter.drawText(bg_x + margin, bg_y + text_h - 2, hint)
+            text = "选择模式 · 还没有标注，先切换到画笔/矩形/箭头/文字工具绘制"
+        self._cursor_hint.set_text(text)
 
     def _draw_selection(self, painter: QPainter, shape: dict) -> None:
         """在选中的标注周围画虚线框 + 角点。"""
