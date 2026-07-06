@@ -109,6 +109,7 @@ class AnnotationOverlay(QWidget):
     """
 
     annotation_changed = Signal()
+    tool_changed = Signal(str)  # 工具变化通知（让 Bar 同步按钮状态）
     # 鼠标事件信号：把轮询线程的事件切到主线程处理
     _mouse_event = Signal(str, int, int)
 
@@ -131,12 +132,19 @@ class AnnotationOverlay(QWidget):
         self.color = QColor(231, 76, 60, 230)
         self.line_width = 4
         self.shapes: List[dict] = []
+        self._redo_stack: List[dict] = []  # 重做栈
         self._current: Optional[dict] = None
         self._drawing = False
         self._click_feedback_enabled = True  # 点击反馈开关
+        self._trail_enabled = False  # 鼠标轨迹开关
+        self._selected_idx: Optional[int] = None  # 选中的标注索引
+        self._drag_offset: Optional[QPoint] = None  # 拖动偏移
+        self._dragged: bool = False  # 本次按下是否真的发生了拖动
 
         # 鼠标点击反馈动画：{_id: {pos, born}}
         self._clicks: List[dict] = []
+        # 鼠标轨迹点：[{pos, born}]
+        self._trail_points: List[dict] = []
 
         # 信号槽：把轮询线程的鼠标事件切到主线程
         self._mouse_event.connect(self._handle_mouse_event, Qt.QueuedConnection)
@@ -163,6 +171,9 @@ class AnnotationOverlay(QWidget):
             return
         print(f"[OVERLAY] set_tool: {tool}", flush=True)
         self.tool = tool
+        self.tool_changed.emit(tool)
+        # 切换工具时取消选择
+        self.deselect()
 
     def set_color(self, color: QColor) -> None:
         self.color = color
@@ -177,11 +188,182 @@ class AnnotationOverlay(QWidget):
             self._clicks.clear()
             self.update()
 
+    def set_trail(self, enabled: bool) -> None:
+        """开启/关闭鼠标轨迹高亮。"""
+        self._trail_enabled = enabled
+        if not enabled:
+            self._trail_points.clear()
+            self.update()
+        # 同步调整鼠标轮询：开启轨迹时需要空闲移动事件
+        try:
+            self._poller.set_report_idle_moves(enabled)
+        except Exception:
+            pass
+
     def clear(self) -> None:
+        """清空所有标注。不支持 undo 恢复（清空操作不可逆）。"""
         self.shapes = []
+        self._redo_stack.clear()
+        self._current = None
+        self._selected_idx = None
+        self._drag_offset = None
+        self._dragged = False
+        self.update()
+        self.annotation_changed.emit()
+
+    # --- 撤销 / 重做 ---
+
+    def undo(self) -> None:
+        """撤销最后一次标注。"""
+        if not self.shapes:
+            return
+        last = self.shapes.pop()
+        self._redo_stack.append(last)
+        # 撤销后修正选中索引：若选中标注被移除，清空选中
+        if self._selected_idx is not None and self._selected_idx >= len(self.shapes):
+            self._selected_idx = None
+            self._drag_offset = None
         self._current = None
         self.update()
         self.annotation_changed.emit()
+        print(f"[OVERLAY] undo: shapes={len(self.shapes)} redo={len(self._redo_stack)}", flush=True)
+
+    def redo(self) -> None:
+        """重做最后一次撤销的标注。"""
+        if not self._redo_stack:
+            return
+        shape = self._redo_stack.pop()
+        self.shapes.append(shape)
+        self.update()
+        self.annotation_changed.emit()
+        print(f"[OVERLAY] redo: shapes={len(self.shapes)} redo={len(self._redo_stack)}", flush=True)
+
+    def can_undo(self) -> bool:
+        return bool(self.shapes)
+
+    def can_redo(self) -> bool:
+        return bool(self._redo_stack)
+
+    @staticmethod
+    def _is_shape_valid(shape: dict) -> bool:
+        """检查标注是否有效（非零尺寸）。无效标注不推入 shapes。"""
+        tool = shape.get("tool")
+        if tool == "pen":
+            return len(shape["points"]) >= 2
+        elif tool in ("rect", "arrow"):
+            return shape["start"] != shape["end"]
+        elif tool == "text":
+            return bool(shape.get("text"))
+        return False
+
+    # --- 选择与拖动 ---
+
+    def delete_selected(self) -> None:
+        """删除当前选中的标注。"""
+        if self._selected_idx is None:
+            return
+        if 0 <= self._selected_idx < len(self.shapes):
+            removed = self.shapes.pop(self._selected_idx)
+            self._redo_stack.append(removed)
+            self._selected_idx = None
+            self._drag_offset = None
+            self._dragged = False
+            self.update()
+            self.annotation_changed.emit()
+
+    def deselect(self) -> None:
+        """取消选择。"""
+        if self._selected_idx is not None:
+            self._selected_idx = None
+            self._drag_offset = None
+            self.update()
+
+    @staticmethod
+    def _point_distance(p1: QPoint, p2: QPoint) -> float:
+        return math.hypot(p1.x() - p2.x(), p1.y() - p2.y())
+
+    @staticmethod
+    def _point_to_segment_distance(p: QPoint, a: QPoint, b: QPoint) -> float:
+        """点到线段的距离。"""
+        dx, dy = b.x() - a.x(), b.y() - a.y()
+        if dx == 0 and dy == 0:
+            return AnnotationOverlay._point_distance(p, a)
+        t = ((p.x() - a.x()) * dx + (p.y() - a.y()) * dy) / (dx * dx + dy * dy)
+        t = max(0, min(1, t))
+        proj = QPoint(int(a.x() + t * dx), int(a.y() + t * dy))
+        return AnnotationOverlay._point_distance(p, proj)
+
+    def _hit_test(self, pos: QPoint) -> Optional[int]:
+        """命中测试：返回最上层的标注索引，没命中返回 None。"""
+        threshold = max(8, self.line_width + 4)
+        # 从后往前（上层优先）
+        for i in range(len(self.shapes) - 1, -1, -1):
+            shape = self.shapes[i]
+            if self._shape_contains(shape, pos, threshold):
+                return i
+        return None
+
+    def _shape_contains(self, shape: dict, pos: QPoint, threshold: int) -> bool:
+        tool = shape["tool"]
+        if tool == "pen":
+            pts = shape["points"]
+            for i in range(len(pts) - 1):
+                if self._point_to_segment_distance(pos, pts[i], pts[i + 1]) <= threshold:
+                    return True
+            # 单点
+            if len(pts) == 1 and self._point_distance(pos, pts[0]) <= threshold:
+                return True
+            return False
+        elif tool == "rect":
+            r = QRect(shape["start"], shape["end"]).normalized()
+            # 点在矩形内或边框附近都可选中
+            if r.contains(pos):
+                return True
+            left = abs(pos.x() - r.left()) <= threshold and r.top() <= pos.y() <= r.bottom()
+            right = abs(pos.x() - r.right()) <= threshold and r.top() <= pos.y() <= r.bottom()
+            top = abs(pos.y() - r.top()) <= threshold and r.left() <= pos.x() <= r.right()
+            bottom = abs(pos.y() - r.bottom()) <= threshold and r.left() <= pos.x() <= r.right()
+            return left or right or top or bottom
+        elif tool == "arrow":
+            return self._point_to_segment_distance(pos, shape["start"], shape["end"]) <= threshold
+        elif tool == "text":
+            # 简化：以 pos 为中心的矩形
+            text = shape["text"]
+            w = max(20, len(text) * 10)
+            h = 24
+            r = QRect(shape["pos"].x(), shape["pos"].y() - h, w, h + 4)
+            return r.contains(pos)
+        return False
+
+    @staticmethod
+    def _shape_anchor(shape: dict) -> QPoint:
+        """获取形状的锚点（拖动时用作基准点）。"""
+        tool = shape["tool"]
+        if tool == "pen":
+            return shape["points"][0]
+        elif tool in ("rect", "arrow"):
+            return shape["start"]
+        elif tool == "text":
+            return shape["pos"]
+        return QPoint(0, 0)
+
+    @staticmethod
+    def _move_shape_to(shape: dict, new_anchor: QPoint) -> None:
+        """把形状移动到新锚点。"""
+        tool = shape["tool"]
+        if tool == "pen":
+            old = shape["points"][0]
+            dx = new_anchor.x() - old.x()
+            dy = new_anchor.y() - old.y()
+            shape["points"] = [QPoint(p.x() + dx, p.y() + dy) for p in shape["points"]]
+        elif tool in ("rect", "arrow"):
+            old = shape["start"]
+            dx = new_anchor.x() - old.x()
+            dy = new_anchor.y() - old.y()
+            shape["start"] = QPoint(old.x() + dx, old.y() + dy)
+            shape["end"] = QPoint(shape["end"].x() + dx, shape["end"].y() + dy)
+        elif tool == "text":
+            shape["pos"] = QPoint(new_anchor)
 
     # --- 鼠标轮询回调 ---
 
@@ -211,15 +393,20 @@ class AnnotationOverlay(QWidget):
             if self.tool == "text":
                 self._do_text_input(pos)
                 return
-            # 橡皮：删除最后一个标注
+            # 橡皮：删除最后一个标注（等价于撤销，可通过 Ctrl+Y 恢复）
             if self.tool == "eraser":
-                if self.shapes:
-                    self.shapes.pop()
-                    self.update()
-                    self.annotation_changed.emit()
+                self.undo()
                 return
-            # cursor 工具：不画标注
+            # cursor 工具：选择/拖动已有标注
             if self.tool == "cursor":
+                idx = self._hit_test(pos)
+                if idx is not None:
+                    self._selected_idx = idx
+                    shape = self.shapes[idx]
+                    self._drag_offset = pos - self._shape_anchor(shape)
+                    self._dragged = False
+                else:
+                    self._selected_idx = None
                 self.update()
                 return
             # pen / rect / arrow：开始绘制
@@ -236,6 +423,17 @@ class AnnotationOverlay(QWidget):
             self.update()
 
         elif event == "move":
+            # 轨迹收集：未绘制时也要记录（用于鼠标轨迹效果）
+            if self._trail_enabled and not self._drawing:
+                self._trail_points.append({"pos": pos, "born": _now_ms()})
+            # 拖动选中的标注
+            if self.tool == "cursor" and self._selected_idx is not None and self._drag_offset is not None:
+                shape = self.shapes[self._selected_idx]
+                anchor = pos - self._drag_offset
+                self._move_shape_to(shape, anchor)
+                self._dragged = True
+                self.update()
+                return
             if not self._drawing or not self._current:
                 return
             if self._current["tool"] == "pen":
@@ -245,14 +443,30 @@ class AnnotationOverlay(QWidget):
             self.update()
 
         elif event == "up":
-            print(f"[OVERLAY] mouse UP at ({x},{y}) drawing={self._drawing}", flush=True)
+            # 结束拖动
+            if self._drag_offset is not None:
+                # 只有真正拖动了才清空 redo 栈（标准 undo/redo 行为）
+                if self._dragged:
+                    self._redo_stack.clear()
+                    self.annotation_changed.emit()
+                    print(f"[OVERLAY] drag done: shapes={len(self.shapes)} redo cleared", flush=True)
+                self._drag_offset = None
+                self._dragged = False
+                return
             if not self._drawing:
                 return
             self._drawing = False
             if self._current:
-                self.shapes.append(self._current)
+                # 只提交有效标注（非零尺寸），避免误点产生看不见的标注
+                if self._is_shape_valid(self._current):
+                    self.shapes.append(self._current)
+                    # 新标注提交后清空重做栈（标准 undo/redo 行为）
+                    self._redo_stack.clear()
+                    self.annotation_changed.emit()
+                    print(f"[OVERLAY] shape committed: tool={self._current['tool']} shapes={len(self.shapes)}", flush=True)
+                else:
+                    print(f"[OVERLAY] shape discarded (invalid): tool={self._current.get('tool')}", flush=True)
                 self._current = None
-                self.annotation_changed.emit()
             self.update()
 
     def _do_text_input(self, pos: QPoint) -> None:
@@ -274,6 +488,7 @@ class AnnotationOverlay(QWidget):
         edit = QLineEdit(self)
         # overlay 是 WA_TransparentForMouseEvents，子控件需要单独取消穿透
         edit.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        edit.setAttribute(Qt.WA_DeleteOnClose, True)
         edit.setPlaceholderText("输入文字 (Enter确认 / Esc取消)")
         edit.setStyleSheet("""
             QLineEdit {
@@ -304,27 +519,20 @@ class AnnotationOverlay(QWidget):
                     "tool": "text", "color": QColor(self.color),
                     "pos": pos, "text": text,
                 })
+                self._redo_stack.clear()
                 self.update()
                 self.annotation_changed.emit()
             edit.close()
+            self._restart_poller()
 
         def cancel():
             if self._text_confirmed:
                 return
             self._text_confirmed = True
             edit.close()
-
-        def on_destroyed(*args):
-            # 输入框关闭后等待鼠标松开，再恢复轮询，避免误触发
-            from screenrec.platform.mouse_poll import MousePoller, is_left_button_down
-            import time as _time
-            deadline = _time.perf_counter() + 2.0
-            while is_left_button_down() and _time.perf_counter() < deadline:
-                _time.sleep(0.01)
-            self._poller = MousePoller(self._on_mouse_event, interval=0.005)
-            self._poller.start()
-            self._text_edit = None
-            self._esc_filter = None
+            self._restart_poller()
+            # Esc 取消后切回 cursor 工具，避免再点屏幕又出输入框
+            self.set_tool("cursor")
 
         # Esc 键事件过滤器
         class EscapeFilter(QObject):
@@ -338,18 +546,43 @@ class AnnotationOverlay(QWidget):
         edit.installEventFilter(self._esc_filter)
 
         edit.returnPressed.connect(commit)
-        # 关闭时恢复轮询
-        edit.destroyed.connect(on_destroyed)
+        # 失焦自动取消
+        edit.editingFinished.connect(cancel)
+
+    def _restart_poller(self) -> None:
+        """重启鼠标轮询，保留 trail 设置。
+
+        在文字输入完成后调用，确保后续标注工具能继续工作。
+        """
+        from screenrec.platform.mouse_poll import MousePoller, is_left_button_down
+        import time as _time
+        # 等待鼠标松开，避免文字提交时的点击被重新捕获
+        deadline = _time.perf_counter() + 1.0
+        while is_left_button_down() and _time.perf_counter() < deadline:
+            _time.sleep(0.01)
+        try:
+            self._poller = MousePoller(
+                self._on_mouse_event, interval=0.005,
+                report_idle_moves=self._trail_enabled,
+            )
+            self._poller.start()
+            print("[OVERLAY] poller restarted", flush=True)
+        except Exception as e:
+            print(f"[OVERLAY] failed to restart poller: {e}", flush=True)
+        self._text_edit = None
+        self._esc_filter = None
 
     # --- 点击反馈动画 ---
 
     def timerEvent(self, event) -> None:
-        if not self._clicks:
-            return
         now = _now_ms()
-        # 点击反馈持续 500ms
-        self._clicks = [c for c in self._clicks if now - c["born"] < 500]
-        self.update()
+        # 点击反馈持续 600ms（ripple 动画）
+        self._clicks = [c for c in self._clicks if now - c["born"] < 600]
+        # 鼠标轨迹点保留 500ms
+        if self._trail_points:
+            self._trail_points = [p for p in self._trail_points if now - p["born"] < 500]
+        if self._clicks or self._trail_points:
+            self.update()
 
     # --- 绘制 ---
 
@@ -360,21 +593,141 @@ class AnnotationOverlay(QWidget):
         all_shapes = list(self.shapes)
         if self._current:
             all_shapes.append(self._current)
-        for shape in all_shapes:
+        for i, shape in enumerate(all_shapes):
             self._draw_shape(painter, shape)
-        # 画点击反馈
+            # 选中高亮
+            if i == self._selected_idx and not self._current:
+                self._draw_selection(painter, shape)
+        # 画鼠标轨迹（在标注之上、点击反馈之下）
+        self._draw_trail(painter)
+        # 画 cursor 工具提示
+        if self.tool == "cursor":
+            self._draw_cursor_hint(painter)
+        # 画点击反馈（ripple 动画）
         now = _now_ms()
         for c in self._clicks:
             age = now - c["born"]
-            # 0ms: 大圆 r=18, alpha=200
-            # 500ms: 小圆 r=4, alpha=0
-            t = age / 500  # 0..1
-            r = int(18 - 14 * t)
-            alpha = int(200 * (1 - t))
-            if r > 0 and alpha > 0:
+            t = age / 600  # 0..1
+            cx, cy = c["pos"].x(), c["pos"].y()
+            # 中心圆点：快速出现并淡出
+            dot_alpha = int(220 * (1 - t))
+            if dot_alpha > 0:
+                dot_r = int(8 * (1 - t * 0.5))
+                painter.setBrush(QColor(231, 76, 60, dot_alpha))
+                painter.setPen(Qt.NoPen)
+                painter.drawEllipse(c["pos"], dot_r, dot_r)
+            # 扩散环
+            ring_r = int(8 + 40 * t)
+            ring_alpha = int(200 * (1 - t))
+            if ring_alpha > 0 and ring_r > 0:
+                pen = QPen(QColor(231, 76, 60, ring_alpha), 3)
+                painter.setPen(pen)
+                painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(c["pos"], ring_r, ring_r)
+
+    def _draw_cursor_hint(self, painter: QPainter) -> None:
+        """cursor 工具激活时在屏幕顶部显示提示。"""
+        if self._selected_idx is not None:
+            hint = "已选中标注 · 拖动移动 · Delete 删除 · Esc 取消"
+        elif self.shapes:
+            hint = "选择模式 · 点击标注选中 · 拖动移动 · Delete 删除"
+        else:
+            hint = "选择模式 · 还没有标注，先切换到画笔/矩形/箭头/文字工具绘制"
+        painter.setPen(QColor(255, 255, 255, 230))
+        painter.setFont(QFont("Microsoft YaHei", 11))
+        # 计算文字宽度
+        fm = painter.fontMetrics()
+        text_w = fm.horizontalAdvance(hint)
+        text_h = fm.height()
+        # 背景圆角矩形
+        margin = 12
+        bg_w = text_w + margin * 2
+        bg_h = text_h + 8
+        bg_x = (self.width() - bg_w) // 2
+        bg_y = 12
+        painter.setBrush(QColor(44, 62, 80, 220))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(bg_x, bg_y, bg_w, bg_h, 6, 6)
+        # 文字
+        painter.setPen(QColor(255, 255, 255, 230))
+        painter.drawText(bg_x + margin, bg_y + text_h - 2, hint)
+
+    def _draw_selection(self, painter: QPainter, shape: dict) -> None:
+        """在选中的标注周围画虚线框 + 角点。"""
+        bbox = self._shape_bbox(shape)
+        if bbox is None:
+            return
+        pen = QPen(QColor(52, 152, 219, 220), 1, Qt.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(bbox.adjusted(-4, -4, 4, 4))
+        # 角点
+        painter.setBrush(QColor(52, 152, 219, 220))
+        painter.setPen(Qt.NoPen)
+        for corner in [
+            bbox.topLeft(), bbox.topRight(), bbox.bottomLeft(), bbox.bottomRight()
+        ]:
+            painter.drawRect(QRect(corner.x() - 4, corner.y() - 4, 8, 8))
+
+    @staticmethod
+    def _shape_bbox(shape: dict) -> Optional[QRect]:
+        tool = shape["tool"]
+        if tool == "pen":
+            pts = shape["points"]
+            if not pts:
+                return None
+            xs = [p.x() for p in pts]
+            ys = [p.y() for p in pts]
+            return QRect(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
+        elif tool in ("rect", "arrow"):
+            return QRect(shape["start"], shape["end"]).normalized()
+        elif tool == "text":
+            text = shape["text"]
+            w = max(20, len(text) * 10)
+            h = 24
+            return QRect(shape["pos"].x(), shape["pos"].y() - h, w, h + 4)
+        return None
+
+    def _draw_trail(self, painter: QPainter) -> None:
+        """画鼠标轨迹：渐变淡出的折线 + 圆点。"""
+        if not self._trail_points:
+            return
+        now = _now_ms()
+        # 用渐变线段画轨迹
+        from PySide6.QtGui import QLinearGradient, QBrush
+        n = len(self._trail_points)
+        if n < 2:
+            # 只有一个点：画一个小圆
+            p = self._trail_points[0]
+            age = now - p["born"]
+            t = age / 500
+            alpha = int(180 * (1 - t))
+            if alpha > 0:
                 painter.setBrush(QColor(231, 76, 60, alpha))
                 painter.setPen(Qt.NoPen)
-                painter.drawEllipse(c["pos"], r, r)
+                painter.drawEllipse(p["pos"], 4, 4)
+            return
+        # 画连续线段，每段透明度按年龄递减
+        for i in range(1, n):
+            p0 = self._trail_points[i - 1]
+            p1 = self._trail_points[i]
+            age = now - p1["born"]
+            t = age / 500
+            alpha = int(180 * (1 - t))
+            if alpha <= 0:
+                continue
+            pen = QPen(QColor(231, 76, 60, alpha), 4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+            painter.setPen(pen)
+            painter.drawLine(p0["pos"], p1["pos"])
+        # 末端画一个亮点
+        last = self._trail_points[-1]
+        age = now - last["born"]
+        t = age / 500
+        alpha = int(220 * (1 - t))
+        if alpha > 0:
+            painter.setBrush(QColor(231, 76, 60, alpha))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(last["pos"], 5, 5)
 
     def _draw_shape(self, painter: QPainter, shape: dict) -> None:
         tool = shape["tool"]

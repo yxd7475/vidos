@@ -3,7 +3,7 @@
 工具切换 -> 控制 AnnotationOverlay 的工具和模式
 """
 from PySide6.QtCore import Signal, Qt
-from PySide6.QtGui import QColor, QIcon
+from PySide6.QtGui import QColor, QIcon, QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QPushButton, QButtonGroup,
     QColorDialog, QSpinBox, QLabel, QFrame, QToolButton
@@ -22,6 +22,7 @@ class AnnotationBar(QWidget):
     hide_requested = Signal()
     click_feedback_toggled = Signal(bool)  # 点击反馈开关
     cursor_capture_toggled = Signal(bool)  # 鼠标光标录制开关
+    trail_toggled = Signal(bool)  # 鼠标轨迹开关
 
     PRESET_COLORS = [
         "#E74C3C", "#F39C12", "#F1C40F", "#2ECC71",
@@ -53,9 +54,10 @@ class AnnotationBar(QWidget):
         # 工具按钮组
         self._tool_group = QButtonGroup(self)
         self._tool_group.setExclusive(True)
+        self._tool_to_btn: dict = {}  # tool -> button，用于反向同步
 
         tools = [
-            ("cursor", "↖", "光标"),
+            ("cursor", "↖", "选择/移动 (拖动标注，Delete 删除)"),
             ("pen", "✎", "画笔"),
             ("rect", "▭", "矩形"),
             ("arrow", "➤", "箭头"),
@@ -70,6 +72,7 @@ class AnnotationBar(QWidget):
             btn.clicked.connect(lambda *args, t=tool: self._on_tool(t))
             self._tool_group.addButton(btn)
             layout.addWidget(btn)
+            self._tool_to_btn[tool] = btn
             if tool == "cursor":
                 btn.setChecked(True)
 
@@ -128,6 +131,37 @@ class AnnotationBar(QWidget):
         )
         layout.addWidget(self.cursor_btn)
 
+        # 鼠标轨迹开关
+        self.trail_btn = QPushButton("✦ 轨迹")
+        self.trail_btn.setCheckable(True)
+        self.trail_btn.setChecked(False)
+        self.trail_btn.setToolTip("高亮鼠标移动轨迹")
+        self.trail_btn.setMinimumWidth(56)
+        self.trail_btn.clicked.connect(
+            lambda checked: self.trail_toggled.emit(checked)
+        )
+        layout.addWidget(self.trail_btn)
+
+        layout.addWidget(self._sep())
+
+        # 撤销 / 重做
+        self.undo_btn = QPushButton("↶")
+        self.undo_btn.setToolTip("撤销 (Ctrl+Z)")
+        self.undo_btn.setMinimumWidth(36)
+        self.undo_btn.clicked.connect(self._on_undo)
+        layout.addWidget(self.undo_btn)
+
+        self.redo_btn = QPushButton("↷")
+        self.redo_btn.setToolTip("重做 (Ctrl+Y)")
+        self.redo_btn.setMinimumWidth(36)
+        self.redo_btn.clicked.connect(self._on_redo)
+        layout.addWidget(self.redo_btn)
+
+        # 快捷键：Ctrl+Z/Y/Delete 已由全局热键处理（不依赖焦点），
+        # 这里只保留 Esc 取消选择（局部快捷键即可）
+        self._shortcut_esc = QShortcut(QKeySequence("Escape"), self)
+        self._shortcut_esc.activated.connect(self._on_deselect)
+
         layout.addWidget(self._sep())
 
         clear_btn = QPushButton("清空")
@@ -149,9 +183,16 @@ class AnnotationBar(QWidget):
         self.clear_requested.connect(overlay.clear)
         self.hide_requested.connect(self.hide)
 
+        # overlay 主动改工具时（如文字 Esc 回退）同步按钮状态
+        overlay.tool_changed.connect(self._sync_tool_button)
+
+        # 撤销/重做按钮状态跟随 overlay
+        overlay.annotation_changed.connect(self._update_undo_redo_state)
+
         # 初始
         overlay.set_color(QColor(self.PRESET_COLORS[0]))
         overlay.set_line_width(4)
+        self._update_undo_redo_state()
 
     @staticmethod
     def _sep() -> QFrame:
@@ -164,6 +205,25 @@ class AnnotationBar(QWidget):
     def _on_tool(self, tool: str) -> None:
         print(f"[BAR] tool selected: {tool}", flush=True)
         self.tool_changed.emit(tool)
+
+    def _sync_tool_button(self, tool: str) -> None:
+        """overlay 主动改工具时同步按钮 checked 状态。"""
+        btn = self._tool_to_btn.get(tool)
+        if btn is not None and not btn.isChecked():
+            btn.setChecked(True)
+
+    def _on_undo(self) -> None:
+        self.overlay.undo()
+
+    def _on_redo(self) -> None:
+        self.overlay.redo()
+
+    def _on_deselect(self) -> None:
+        self.overlay.deselect()
+
+    def _update_undo_redo_state(self) -> None:
+        self.undo_btn.setEnabled(self.overlay.can_undo())
+        self.redo_btn.setEnabled(self.overlay.can_redo())
 
     def _on_color(self, color: QColor) -> None:
         self.color_changed.emit(color)

@@ -100,6 +100,7 @@ class ScreenCapture:
         self._use_dxcam = use_dxcam and _HAS_DXCAM
         self._draw_cursor = draw_cursor
         self._running = False
+        self.paused = False  # 暂停标志：True 时跳过抓帧
         self._thread: Optional[threading.Thread] = None
         self._callback: Optional[FrameCallback] = None
         self._camera = None
@@ -127,6 +128,10 @@ class ScreenCapture:
 
         if self._use_dxcam:
             while self._running:
+                if self.paused:
+                    time.sleep(interval)
+                    next_t = time.perf_counter()
+                    continue
                 frame = self._camera.grab()
                 if frame is not None and self._callback is not None:
                     # dxcam 返回的是只读共享内存，叠加光标前必须 copy
@@ -146,6 +151,10 @@ class ScreenCapture:
         with mss.mss() as sct:
             monitor = self._monitor_for(sct)
             while self._running:
+                if self.paused:
+                    time.sleep(interval)
+                    next_t = time.perf_counter()
+                    continue
                 img = sct.grab(monitor)
                 arr = np.asarray(img)
                 if self._callback is not None:

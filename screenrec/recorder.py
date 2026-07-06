@@ -22,11 +22,35 @@ class Recorder:
         self.audio_cap: Optional[AudioCapture] = None
         self.encoder: Optional[PyAVEncoder] = None
         self._running = False
+        self._paused = False
         self._audio_thread: Optional[threading.Thread] = None
 
     @property
     def running(self) -> bool:
         return self._running
+
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    def pause(self) -> None:
+        """暂停录制：不再写入新帧，但保持编码器和采集器活动。"""
+        if not self._running or self._paused:
+            return
+        self._paused = True
+        if self.screen_cap is not None:
+            self.screen_cap.paused = True
+
+    def resume(self) -> None:
+        """从暂停恢复录制。"""
+        if not self._running or not self._paused:
+            return
+        self._paused = False
+        if self.screen_cap is not None:
+            self.screen_cap.paused = False
+        # 让编码器重置时间基准，避免暂停期间累积的时间一次性灌入
+        if self.encoder is not None:
+            self.encoder.resume_from_pause()
 
     def start(self, region: Region, output_path,
               include_system: bool = True, include_mic: bool = False) -> None:
@@ -66,19 +90,22 @@ class Recorder:
         self.screen_cap.start()
 
     def _on_frame(self, frame) -> None:
+        if self._paused:
+            return
         if self.encoder is not None:
             self.encoder.write_video_frame(frame.tobytes())
 
     def _audio_loop(self) -> None:
         while self._running and self.audio_cap is not None:
-            if self.audio_cap.include_system:
-                data = self.audio_cap.read_system()
-                if data and self.encoder is not None:
-                    self.encoder.write_audio(data, kind="system")
-            if self.audio_cap.include_mic:
-                data = self.audio_cap.read_mic()
-                if data and self.encoder is not None:
-                    self.encoder.write_audio(data, kind="mic")
+            if not self._paused:
+                if self.audio_cap.include_system:
+                    data = self.audio_cap.read_system()
+                    if data and self.encoder is not None:
+                        self.encoder.write_audio(data, kind="system")
+                if self.audio_cap.include_mic:
+                    data = self.audio_cap.read_mic()
+                    if data and self.encoder is not None:
+                        self.encoder.write_audio(data, kind="mic")
             time.sleep(0.005)
 
     def stop(self) -> Optional[Path]:

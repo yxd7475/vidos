@@ -129,6 +129,27 @@ class PyAVEncoder:
 
     # --- 写入 ---
 
+    def resume_from_pause(self) -> None:
+        """从暂停恢复：重置 start_time，避免暂停期间累积的时间一次性灌入。
+
+        视频和音频都基于 (perf_counter - start_time) 做 PTS，
+        暂停期间 start_time 没动，恢复后 elapsed 会跳跃。
+        这里把 start_time 平移到当前时刻，让 PTS 平滑衔接。
+        同时把 _last_video_pts 也清零，避免单调递增检查冲突。
+        """
+        with self._lock:
+            if self._start_time is None:
+                return
+            # 把 start_time 平移到现在，相当于"重置时钟"
+            self._start_time = time.perf_counter()
+            # 不重置 _last_video_pts：让下一帧 PTS 严格大于暂停前的最后一帧
+            # PTS 用 1/1000 时间基，平移 start_time 后 elapsed 从 0 开始
+            # 但 _last_video_pts 可能很大，强制下一帧 PTS = _last_video_pts + 1
+            # 这样视频时间线连续，但音频也需要相应处理
+            # 简化：音频也基于 start_time，恢复后第一帧 _audio_first_pts 重新算
+            self._audio_first_pts = None
+            self._audio_samples_written = 0
+
     def write_video_frame(self, bgra_bytes: bytes) -> None:
         with self._lock:
             if self._vstream is None or self._start_time is None:
