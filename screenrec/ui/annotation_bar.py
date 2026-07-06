@@ -23,6 +23,7 @@ class AnnotationBar(QWidget):
     click_feedback_toggled = Signal(bool)  # 点击反馈开关
     cursor_capture_toggled = Signal(bool)  # 鼠标光标录制开关
     trail_toggled = Signal(bool)  # 鼠标轨迹开关
+    keystroke_toggled = Signal(bool)  # 按键回显开关
 
     PRESET_COLORS = [
         "#E74C3C", "#F39C12", "#F1C40F", "#2ECC71",
@@ -141,6 +142,17 @@ class AnnotationBar(QWidget):
             lambda checked: self.trail_toggled.emit(checked)
         )
         layout.addWidget(self.trail_btn)
+
+        # 按键回显开关
+        self.keystroke_btn = QPushButton("⌨ 按键")
+        self.keystroke_btn.setCheckable(True)
+        self.keystroke_btn.setChecked(False)
+        self.keystroke_btn.setToolTip("在屏幕左下角显示按键回显")
+        self.keystroke_btn.setMinimumWidth(56)
+        self.keystroke_btn.clicked.connect(
+            lambda checked: self.keystroke_toggled.emit(checked)
+        )
+        layout.addWidget(self.keystroke_btn)
 
         layout.addWidget(self._sep())
 

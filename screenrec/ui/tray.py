@@ -2,27 +2,66 @@
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QObject, Signal
-from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QAction
+from PySide6.QtCore import QObject, Signal, Qt
+from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QAction, QPen
 from PySide6.QtWidgets import QSystemTrayIcon, QMenu
 
 from screenrec.platform.win32 import set_exclude_from_capture
 
 
 def _make_icon(color: str = "#e74c3c") -> QIcon:
-    """程序化生成一个简单的圆形录制图标。"""
+    """程序化生成摄像机图标：机身 + 镜头 + 录制指示灯。
+
+    color 用于录制灯：红=录制中、橙=暂停、灰=就绪。
+    """
+    from PySide6.QtGui import QPainterPath
+    from PySide6.QtCore import QPointF
+
     pm = QPixmap(64, 64)
     pm.fill(QColor(0, 0, 0, 0))
     p = QPainter(pm)
     p.setRenderHint(QPainter.Antialiasing)
-    # 外圈深色
-    p.setPen(QColor("#2c3e50"))
-    p.setBrush(QColor("#2c3e50"))
-    p.drawEllipse(2, 2, 60, 60)
-    # 内圈录制色
-    p.setPen(QColor(color))
-    p.setBrush(QColor(color))
-    p.drawEllipse(8, 8, 48, 48)
+
+    body = QColor("#2c3e50")
+    body_light = QColor("#34495e")
+    accent = QColor(color)
+
+    # 机身（圆角矩形）
+    p.setPen(Qt.NoPen)
+    p.setBrush(body)
+    p.drawRoundedRect(6, 18, 40, 28, 5, 5)
+
+    # 镜头罩（右侧梯形凸起）
+    p.setBrush(body_light)
+    hood = QPainterPath()
+    hood.moveTo(46, 22)
+    hood.lineTo(58, 16)
+    hood.lineTo(58, 48)
+    hood.lineTo(46, 42)
+    hood.closeSubpath()
+    p.drawPath(hood)
+
+    # 镜头（中央黑圆 + 深灰内圈 + 高光）
+    p.setBrush(QColor("#0f1419"))
+    p.drawEllipse(QPointF(22, 32), 9, 9)
+    p.setBrush(QColor("#1c2833"))
+    p.drawEllipse(QPointF(22, 32), 6.5, 6.5)
+    # 高光
+    p.setBrush(QColor(255, 255, 255, 90))
+    p.drawEllipse(QPointF(19, 29), 2.5, 2.5)
+
+    # 取景器小窗（机身上方）
+    p.setBrush(body_light)
+    p.drawRoundedRect(14, 13, 14, 6, 2, 2)
+
+    # 录制指示灯（左上角，颜色随状态变化）
+    p.setBrush(accent)
+    p.drawEllipse(QPointF(38, 24), 3, 3)
+    # 灯外圈深色描边，让浅色背景下也清晰
+    p.setPen(QPen(QColor("#000000"), 0.5))
+    p.setBrush(Qt.NoBrush)
+    p.drawEllipse(QPointF(38, 24), 3, 3)
+
     p.end()
     return QIcon(pm)
 

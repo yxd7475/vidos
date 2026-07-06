@@ -7,7 +7,7 @@ from typing import Tuple
 @dataclass
 class Config:
     output_dir: Path = field(default_factory=lambda: Path.home() / "Videos" / "ScreenRec")
-    fps: int = 30
+    fps: int = 60
     quality: str = "high"  # high / standard / smooth
     audio_bitrate: str = "160k"
     include_system_audio: bool = True

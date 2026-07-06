@@ -15,11 +15,13 @@ from screenrec.config import Config
 from screenrec.recorder import Recorder
 from screenrec.ui.overlay import RegionSelectorOverlay, AnnotationOverlay
 from screenrec.ui.annotation_bar import AnnotationBar
-from screenrec.ui.tray import TrayController
+from screenrec.ui.tray import TrayController, _make_icon
 from screenrec.ui.recordings_panel import RecordingsPanel
 from screenrec.ui.camera_pip import CameraPiP
+from screenrec.ui.keystroke_overlay import KeystrokeOverlay
 from screenrec.platform.win32 import set_exclude_from_capture
 from screenrec.platform.hotkey import HotkeyManager, MOD_CONTROL, VK_F9, VK_F10, VK_Z, VK_Y, VK_DELETE
+from screenrec.platform.keyboard_hook import KeyboardHook
 
 
 class FinalizeWorker(QObject):
@@ -48,6 +50,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ScreenRec")
+        self.setWindowIcon(_make_icon("#e74c3c"))
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
         self.setMinimumSize(340, 480)
 
@@ -59,6 +62,9 @@ class MainWindow(QMainWindow):
         self.overlay: Optional[AnnotationOverlay] = None
         self.bar: Optional[AnnotationBar] = None
         self.camera_pip: Optional[CameraPiP] = None
+        self.keystroke_overlay: Optional[KeystrokeOverlay] = None
+        self._kbd_hook: Optional[KeyboardHook] = None
+        self._keystroke_enabled = False
 
         self._state = "idle"  # idle, recording, paused, processing
         self._finalize_thread: Optional[QThread] = None
@@ -334,6 +340,7 @@ class MainWindow(QMainWindow):
         self.bar.click_feedback_toggled.connect(self.overlay.set_click_feedback)
         self.bar.cursor_capture_toggled.connect(self._on_cursor_capture_toggled)
         self.bar.trail_toggled.connect(self.overlay.set_trail)
+        self.bar.keystroke_toggled.connect(self._toggle_keystroke_overlay)
         self.bar.show()
 
         # 全局热键已在 __init__ 注册
@@ -345,6 +352,11 @@ class MainWindow(QMainWindow):
         self._elapsed.start()
         self._timer.start()
         self._update_state()
+
+        # 自动最小化到托盘，避免主窗口挡住录制内容
+        self.hide()
+        if self._tray is not None:
+            self._tray.notify("ScreenRec", "录制中…F9 停止 · F10 暂停 · 双击图标恢复窗口", ms=3000)
 
     def _register_hotkeys(self) -> None:
         """注册全局热键：F9 开始/停止、F10 暂停/继续。"""
@@ -497,6 +509,14 @@ class MainWindow(QMainWindow):
             self.overlay = None
         # 注销标注快捷键
         self._unregister_annotation_hotkeys()
+        # 按键回显：停钩子 + 隐藏浮层，下次录制需要重新打开
+        if self._kbd_hook is not None:
+            self._kbd_hook.stop()
+            self._kbd_hook = None
+        if self.keystroke_overlay is not None:
+            self.keystroke_overlay.close()
+            self.keystroke_overlay = None
+        self._keystroke_enabled = False
         # 摄像头 PiP：关闭并清空，下次录制需要重新打开
         if self.camera_pip is not None:
             self.camera_pip.close()
@@ -559,6 +579,29 @@ class MainWindow(QMainWindow):
         """切换鼠标光标是否录制。"""
         if self.recorder is not None and self.recorder.screen_cap is not None:
             self.recorder.screen_cap._draw_cursor = enabled
+
+    def _toggle_keystroke_overlay(self, enabled: bool) -> None:
+        """切换按键回显浮层。
+
+        开启时：创建浮层 + 启动键盘钩子
+        关闭时：停钩子 + 隐藏浮层（保留实例以便复用）
+        """
+        self._keystroke_enabled = enabled
+        if enabled:
+            if self.keystroke_overlay is None:
+                self.keystroke_overlay = KeystrokeOverlay()
+            self.keystroke_overlay.show()
+            if self._kbd_hook is None:
+                self._kbd_hook = KeyboardHook(self.keystroke_overlay.on_key)
+                if not self._kbd_hook.start():
+                    print("[KEY] keyboard hook start failed", flush=True)
+                    self._kbd_hook = None
+        else:
+            if self._kbd_hook is not None:
+                self._kbd_hook.stop()
+                self._kbd_hook = None
+            if self.keystroke_overlay is not None:
+                self.keystroke_overlay.hide()
 
     # --- 计时与状态 ---
 
